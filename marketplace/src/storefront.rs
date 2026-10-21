@@ -2,7 +2,7 @@ use crate::{
     DataKey, MarketplaceContract, MarketplaceError, Merchant, PERSISTENT_BUMP_AMOUNT,
     PERSISTENT_BUMP_THRESHOLD,
 };
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol};
 
 const MAX_IPFS_CID_LEN: u32 = 128;
 
@@ -21,6 +21,14 @@ pub struct StorefrontMetadata {
 pub struct StorefrontMetadataUpdatedEvent {
     pub merchant_id: u64,
     pub metadata: StorefrontMetadata,
+}
+
+/// Event emitted when a merchant's storefront is suspended or reinstated.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MerchantSuspensionEvent {
+    pub merchant_id: u64,
+    pub suspended: bool,
 }
 
 /// Stores a validated IPFS CID and its SHA-256 digest for the merchant.
@@ -73,6 +81,104 @@ pub fn set_storefront_metadata(
     );
 
     Ok(())
+}
+
+/// Suspends a merchant's storefront, blocking new order creation while
+/// allowing in-flight escrows to settle normally.
+pub fn suspend_merchant(
+    env: Env,
+    admin: Address,
+    merchant: Address,
+    reason: Symbol,
+) -> Result<bool, MarketplaceError> {
+    admin.require_auth();
+
+    let stored_admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(MarketplaceError::Unauthorized)?;
+    if stored_admin != admin {
+        return Err(MarketplaceError::Unauthorized);
+    }
+
+    let merchant_id = MarketplaceContract::get_merchant_id_by_owner_internal(&env, &merchant)?;
+    let mut record: Merchant = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Merchant(merchant_id))
+        .ok_or(MarketplaceError::MerchantNotFound)?;
+
+    record.status = crate::MerchantStatus::Suspended;
+    let key = DataKey::Merchant(merchant_id);
+    env.storage().persistent().set(&key, &record);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_BUMP_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+
+    env.events().publish(
+        (
+            symbol_short!("mkplc"),
+            symbol_short!("sf_susp"),
+            merchant_id,
+        ),
+        (reason, MerchantSuspensionEvent {
+            merchant_id,
+            suspended: true,
+        }),
+    );
+
+    Ok(true)
+}
+
+/// Reinstates a previously suspended merchant's storefront.
+pub fn reinstate_merchant(
+    env: Env,
+    admin: Address,
+    merchant: Address,
+) -> Result<bool, MarketplaceError> {
+    admin.require_auth();
+
+    let stored_admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(MarketplaceError::Unauthorized)?;
+    if stored_admin != admin {
+        return Err(MarketplaceError::Unauthorized);
+    }
+
+    let merchant_id = MarketplaceContract::get_merchant_id_by_owner_internal(&env, &merchant)?;
+    let mut record: Merchant = env
+        .storage()
+        .persistent()
+        .get(&DataKey::Merchant(merchant_id))
+        .ok_or(MarketplaceError::MerchantNotFound)?;
+
+    record.status = crate::MerchantStatus::Active;
+    let key = DataKey::Merchant(merchant_id);
+    env.storage().persistent().set(&key, &record);
+    env.storage().persistent().extend_ttl(
+        &key,
+        PERSISTENT_BUMP_THRESHOLD,
+        PERSISTENT_BUMP_AMOUNT,
+    );
+
+    env.events().publish(
+        (
+            symbol_short!("mkplc"),
+            symbol_short!("sf_rein"),
+            merchant_id,
+        ),
+        MerchantSuspensionEvent {
+            merchant_id,
+            suspended: false,
+        },
+    );
+
+    Ok(true)
 }
 
 fn is_valid_ipfs_cid(cid: &String) -> bool {
